@@ -2,11 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { Send, Bot } from 'lucide-react';
 import { supabase } from '../lib/supabase';
 import { ChatOpenAI , OpenAIEmbeddings } from '@langchain/openai';
-// import { PromptTemplate } from 'langchain/prompts';
-// import { pipeline } from '@xenova/transformers';
-// import { Configuration, OpenAIApi } from 'openai';
 import { SupabaseVectorStore } from "@langchain/community/vectorstores/supabase";
-
 import { RunnableSequence } from '@langchain/core/runnables';
 import { formatDocumentsAsString } from 'langchain/util/document';
 
@@ -45,7 +41,7 @@ export function Chat() {
 
         if (data) {
           const formattedMessages = data.map((item) => [
-            { role: 'user' as const, content: item.message, source: item.sources },
+            { role: 'user' as const, content: item.message },
             { role: 'assistant' as const, content: item.response, source: item.sources },
           ]).flat();
           setMessages(formattedMessages);
@@ -107,31 +103,71 @@ export function Chat() {
          */
 
         // 3. Define the prompt template
+        // const SYSTEM_TEMPLATE = `You are a helpful AI assistant. Use the following context to help answer the question. Be concise.
+
+        // Context: {context}
+
+        // Question: {question}
+        
+        // try first to answer the question using the context then your general knowledge.
+        // `;
         const SYSTEM_TEMPLATE = `You are a helpful AI assistant. Use the following context to help answer the question. Be concise.
 
-        Context: {context}
+          Context: {context}
 
-        Question: {question}
-        
-        try first to answer the question using the context then your general knowledge.
-        `;
+          Question: {question}
+
+          First try to answer the question using the provided context. If the context doesn't contain enough information to answer the question, clearly state "CONTEXT_INSUFFICIENT" at the beginning of your response, then provide your best answer based on general knowledge.
+
+          Remember to be concise in your responses.`;
 
         // 4. prepare the Chain Sequence
         const ragChain = RunnableSequence.from([
-          {
-            context: async (inputQuestion: { question: string }) => {
-              const docs = await retriever.invoke(inputQuestion.question);
-              return formatDocumentsAsString(docs);
-            },
-            sources: async (inputQuestion: { question: string }) => {
-              const docs = await retriever.invoke(inputQuestion.question);
-              return [...new Set(docs.map(doc => doc.metadata.source))].join(', ');
-            },
-            question: (inputQuestion: { question: string }) => inputQuestion.question,
+          // Step 1: Extract the question
+          (input: { question: string }) => input.question,
+          
+          // Step 2: Retrieve documents
+          async (question: string) => {
+            const docs = await retriever.invoke(question);
+            return {
+              question,
+              context: formatDocumentsAsString(docs),
+              sources: [...new Set(docs.map(doc => doc.metadata.source))].join(', ')
+            };
           },
+          
+          // Step 3: Generate response using LLM
           async ({ context, question, sources }) => {
-            const response = await llm.invoke(SYSTEM_TEMPLATE.replace('{context}', context).replace('{question}', question));
-            return { content: response.content.toString(), sources };
+            const prompt = SYSTEM_TEMPLATE.replace('{context}', context).replace('{question}', question);
+            const response = await llm.invoke(prompt);
+            return { 
+              question,
+              content: response.content.toString(), 
+              sources 
+            };
+          },
+          // Step 4: Handle unanswered queries
+          async ({ content, sources, question }) => {
+            // Check if the response indicates insufficient context
+            if (content.includes("CONTEXT_INSUFFICIENT")) {
+              try {
+                // Call Supabase function to handle the unanswered query
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const { data, error } = await supabase.functions.invoke('fn_handle_unanswered_query', 
+                  {
+                    body: {query: question }
+                  });
+                
+                if (error) {
+                  console.error('Error calling Supabase function:', error);
+                } 
+              } catch (error) {
+                console.error('Failed to call Supabase fallback:', error);
+              }
+            }
+            
+            // Return original response
+            return { content, sources, fallbackUsed: content.includes("CONTEXT_INSUFFICIENT") };
           }
         ]);
         
@@ -143,7 +179,7 @@ export function Chat() {
         console.log('✅ Answer:', result);
         setMessages((prev) => [
           ...prev,
-          { role: 'assistant', content: result.content, source: result.sources },
+          { role: 'assistant', content: result.content.replace("CONTEXT_INSUFFICIENT", ""), source: result.fallbackUsed ? '' : result.sources },
         ]);
 
         // 6. Store the conversation in Supabase
@@ -151,8 +187,8 @@ export function Chat() {
         {
           user_id: (await supabase.auth.getUser()).data.user?.id,
           message: input,
-          response: result.content,
-          sources: result.sources,
+          response: result.content.replace("CONTEXT_INSUFFICIENT", ""),
+          sources: result.fallbackUsed ? '' : result.sources,
         },
         ]);
 
